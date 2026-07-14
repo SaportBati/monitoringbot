@@ -56,7 +56,7 @@ from bs4 import BeautifulSoup
 # ------------------- НАСТРОЙКИ -------------------
 
 IMAP_SERVER = "imap.gmail.com"
-EMAIL_ACCOUNT = "ВАШ_EMAIL@gmail.com"          # <-- укажите свою почту
+EMAIL_ACCOUNT = "grebenkinmatveyvyceslacovi2007@gmail.com"          # <-- укажите свою почту
 APP_PASSWORD = "ltdc girf btdu ihzs"           # пароль приложения Gmail
 BOT_TOKEN = "8808314870:AAHmQRtoaxcJXGQr1EdOBlHzIro20RzhFPw"
 
