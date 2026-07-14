@@ -2,35 +2,28 @@
 Мониторинг Gmail (IMAP) на предмет писем о новых темах форума
 и рассылка уведомлений подписчикам Telegram-бота.
 
+ВЕРСИЯ С ПОДДЕРЖКОЙ МНОГОПОЛЬЗОВАТЕЛЬСКОЙ НАСТРОЙКИ:
+Каждый пользователь сам настраивает свои учетные данные Gmail через команду /setup
+
 Скрипт полностью самодостаточен: при первом запуске сам ставит
 недостающие библиотеки (requests, beautifulsoup4), поэтому для
 хостинга достаточно одного этого файла.
 
 Что делает скрипт:
-1. Раз в POLL_INTERVAL секунд подключается к Gmail по IMAP,
-   проходит ВСЕ папки (включая Спам), ищет письма с темой,
-   содержащей SUBJECT_FILTER.
-2. Из найденного письма достаёт заголовок темы и ссылку,
-   спрятанную за кнопкой "Посмотреть эту тему".
-3. Рассылает эти данные всем подписчикам Telegram-бота.
-4. Параллельно слушает Telegram:
-     /start      - подписаться на рассылку (только если пользователю
-                   разрешён доступ администратором)
+1. При команде /setup пользователь вводит свой Gmail и пароль приложения
+2. Раз в POLL_INTERVAL секунд проверяет ВСЕ папки почты всех пользователей,
+   ищет письма с темой, содержащей SUBJECT_FILTER
+3. Из найденного письма достаёт заголовок темы и ссылку,
+   спрятанную за кнопкой "Посмотреть эту тему"
+4. Рассылает эти данные подписчикам
+5. Параллельно слушает Telegram:
+     /setup      - настроить/изменить учетные данные Gmail
+     /start      - подписаться на рассылку
      /stop       - отписаться
-     /ping       - статус бота (аптайм, время последней проверки почты,
-                   подключение к Gmail, число подписчиков) — только для админов
+     /status     - показать статус бота (только для админов)
      /sell @user - (только для админов) выдать пользователю @user доступ
-                   к команде /start
 
 Администраторы (задаются по Telegram-username, без @): NehtoOtto, yisroelwork.
-Список пользователей, которым выдан доступ (через /sell), и список
-подписчиков хранятся в файлах в папке data/ и переживают перезапуск бота.
-
-Перед запуском:
-- впишите свой Gmail-адрес в EMAIL_ACCOUNT ниже
-- в Gmail должен быть включён доступ по IMAP
-  (Настройки -> Пересылка и POP/IMAP -> Включить IMAP)
-- APP_PASSWORD — это пароль приложения (app password), не обычный пароль
 """
 
 import sys
@@ -63,8 +56,6 @@ from bs4 import BeautifulSoup
 # ------------------- НАСТРОЙКИ -------------------
 
 IMAP_SERVER = "imap.gmail.com"
-EMAIL_ACCOUNT = "ВАШ_EMAIL@gmail.com"          # <-- укажите свою почту
-APP_PASSWORD = "ltdc girf btdu ihzs"           # пароль приложения Gmail
 BOT_TOKEN = "8808314870:AAHmQRtoaxcJXGQr1EdOBlHzIro20RzhFPw"
 
 POLL_INTERVAL = 30              # как часто проверять почту, секунд
@@ -77,21 +68,21 @@ DATA_DIR = "data"
 SUBSCRIBERS_FILE = os.path.join(DATA_DIR, "subscribers.json")
 PROCESSED_FILE = os.path.join(DATA_DIR, "processed.json")
 ALLOWED_FILE = os.path.join(DATA_DIR, "allowed_users.json")
+GMAIL_CREDENTIALS_FILE = os.path.join(DATA_DIR, "gmail_credentials.json")
+USER_SETUP_STATE_FILE = os.path.join(DATA_DIR, "user_setup_state.json")
 
 # Администраторы бота (Telegram-username без "@", в нижнем регистре).
-# У админов всегда есть доступ к /start, /ping и они могут выдавать
-# доступ другим пользователям через /sell @username.
 ADMIN_USERNAMES = {"nehtootto", "yisroelwork"}
 
 os.makedirs(DATA_DIR, exist_ok=True)
 
-# ------------------- СОСТОЯНИЕ БОТА (для /ping) -------------------
+# ------------------- СОСТОЯНИЕ БОТА (для /status) -------------------
 
 START_TIME = datetime.datetime.now()
-LAST_CHECK_TIME = None          # когда последний раз проверяли почту
-LAST_CHECK_OK = None            # успешно ли прошло подключение при последней проверке
-LAST_CHECK_ERROR = ""           # текст последней ошибки, если была
-LAST_NOTIFICATION_SUBJECT = ""  # тема последнего отправленного уведомления
+LAST_CHECK_TIME = None
+LAST_CHECK_OK = None
+LAST_CHECK_ERROR = ""
+LAST_NOTIFICATION_SUBJECT = ""
 LAST_NOTIFICATION_TIME = None
 
 state_lock = threading.Lock()
@@ -100,21 +91,31 @@ state_lock = threading.Lock()
 
 def load_json(path, default):
     if os.path.exists(path):
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return default
     return default
 
 
 def save_json(path, data):
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[ERROR] Не удалось сохранить {path}: {e}")
 
 
 subscribers = set(load_json(SUBSCRIBERS_FILE, []))
 processed_ids = set(load_json(PROCESSED_FILE, []))
-# Username'ы (в нижнем регистре, без "@"), которым админ выдал доступ
-# к /start командой /sell @username.
 allowed_users = set(u.lower() for u in load_json(ALLOWED_FILE, []))
+
+# Хранилище учетных данных: {user_id: {"email": "...", "password": "...", "username": "..."}}
+gmail_credentials = load_json(GMAIL_CREDENTIALS_FILE, {})
+
+# Состояние настройки пользователей: {user_id: {"step": 1 или 2, "email": "..."}}
+user_setup_state = load_json(USER_SETUP_STATE_FILE, {})
 
 # ------------------- РАБОТА С ПОЧТОЙ -------------------
 
@@ -190,26 +191,27 @@ def get_all_folders(imap):
     return result
 
 
-def test_gmail_connection():
-    """Быстрая проверка, что логин по IMAP проходит. Используется для /ping."""
+def test_gmail_connection(email_account, app_password):
+    """Быстрая проверка, что логин по IMAP проходит."""
     try:
         imap = imaplib.IMAP4_SSL(IMAP_SERVER)
-        imap.login(EMAIL_ACCOUNT, APP_PASSWORD)
+        imap.login(email_account, app_password)
         imap.logout()
         return True, ""
     except Exception as e:
         return False, str(e)
 
 
-def check_mail():
+def check_mail_for_user(user_id, email_account, app_password, username):
+    """Проверяет почту для конкретного пользователя."""
     global LAST_CHECK_TIME, LAST_CHECK_OK, LAST_CHECK_ERROR
     global LAST_NOTIFICATION_SUBJECT, LAST_NOTIFICATION_TIME
 
     try:
         imap = imaplib.IMAP4_SSL(IMAP_SERVER)
-        imap.login(EMAIL_ACCOUNT, APP_PASSWORD)
+        imap.login(email_account, app_password)
     except Exception as e:
-        print(f"[IMAP] Ошибка подключения: {e}")
+        print(f"[IMAP] Ошибка подключения для {username} ({email_account}): {e}")
         with state_lock:
             LAST_CHECK_TIME = datetime.datetime.now()
             LAST_CHECK_OK = False
@@ -244,7 +246,7 @@ def check_mail():
                 raw_email = msg_data[0][1]
                 msg = email.message_from_bytes(raw_email)
 
-                message_id = msg.get("Message-ID") or f"{folder}-{eid.decode()}"
+                message_id = f"{user_id}-{msg.get('Message-ID') or f'{folder}-{eid.decode()}'}"
                 if message_id in processed_ids:
                     continue
 
@@ -257,9 +259,9 @@ def check_mail():
                 html_body, _ = get_email_body(msg)
                 link = extract_topic_link(html_body)
 
-                text = f"📢 {subject}"
+                text = f"📢 {subject}\n\n👤 <b>От:</b> @{username}"
                 if link:
-                    text += f"\n{link}"
+                    text += f"\n🔗 {link}"
 
                 send_telegram_message(text)
                 processed_ids.add(message_id)
@@ -268,10 +270,10 @@ def check_mail():
                     LAST_NOTIFICATION_SUBJECT = subject
                     LAST_NOTIFICATION_TIME = datetime.datetime.now()
 
-                print(f"[MAIL] Отправлено уведомление: {subject}")
+                print(f"[MAIL] ({username}) Отправлено уведомление: {subject}")
 
             except Exception as e:
-                print(f"[MAIL] Ошибка обработки письма: {e}")
+                print(f"[MAIL] ({username}) Ошибка обработки письма: {e}")
                 continue
 
     try:
@@ -286,6 +288,25 @@ def check_mail():
         LAST_CHECK_OK = True
         LAST_CHECK_ERROR = ""
 
+
+def mail_monitor_thread():
+    """Фоновый поток, проверяющий почту всех пользователей."""
+    print("Мониторинг почты запущен. Ожидание новых писем...")
+    while True:
+        # Проверяем почту для каждого настроенного пользователя
+        for user_id_str, creds in gmail_credentials.items():
+            try:
+                check_mail_for_user(
+                    user_id_str,
+                    creds["email"],
+                    creds["password"],
+                    creds.get("username", "unknown")
+                )
+            except Exception as e:
+                print(f"[ERROR] Ошибка при проверке почты пользователя {user_id_str}: {e}")
+
+        time.sleep(POLL_INTERVAL)
+
 # ------------------- TELEGRAM -------------------
 
 def is_admin(username):
@@ -298,7 +319,7 @@ def has_start_access(username):
     return is_admin(username) or (bool(username) and username in allowed_users)
 
 
-def send_telegram_message(text, chat_id=None):
+def send_telegram_message(text, chat_id=None, parse_mode="HTML"):
     targets = [chat_id] if chat_id else list(subscribers)
     if not targets:
         return
@@ -306,7 +327,7 @@ def send_telegram_message(text, chat_id=None):
         try:
             requests.post(
                 f"{TG_API}/sendMessage",
-                json={"chat_id": cid, "text": text},
+                json={"chat_id": cid, "text": text, "parse_mode": parse_mode},
                 timeout=10,
             )
         except Exception as e:
@@ -329,9 +350,8 @@ def format_uptime():
     return " ".join(parts)
 
 
-def handle_ping(chat_id):
-    gmail_ok, gmail_error = test_gmail_connection()
-
+def handle_status(chat_id):
+    """Показать статус бота (для администраторов)."""
     with state_lock:
         last_check = LAST_CHECK_TIME
         last_check_ok = LAST_CHECK_OK
@@ -339,27 +359,122 @@ def handle_ping(chat_id):
         last_notif_subj = LAST_NOTIFICATION_SUBJECT
         last_notif_time = LAST_NOTIFICATION_TIME
 
-    lines = ["🤖 Статус бота"]
-    lines.append(f"Аптайм: {format_uptime()}")
-    lines.append(f"Подписчиков: {len(subscribers)}")
+    configured_users = len(gmail_credentials)
 
-    if gmail_ok:
-        lines.append("Gmail: ✅ подключение проходит")
-    else:
-        lines.append(f"Gmail: ❌ ошибка подключения ({gmail_error})")
+    lines = ["🤖 <b>Статус бота</b>"]
+    lines.append(f"⏱ Аптайм: <code>{format_uptime()}</code>")
+    lines.append(f"👥 Подписчиков: <code>{len(subscribers)}</code>")
+    lines.append(f"📧 Настроено почтовых аккаунтов: <code>{configured_users}</code>")
 
     if last_check:
-        status_txt = "успешно" if last_check_ok else f"ошибка ({last_check_error})"
-        lines.append(f"Последняя проверка почты: {last_check.strftime('%Y-%m-%d %H:%M:%S')} — {status_txt}")
+        status_txt = "✅ успешно" if last_check_ok else f"❌ ошибка ({last_check_error})"
+        lines.append(f"📬 Последняя проверка: <code>{last_check.strftime('%Y-%m-%d %H:%M:%S')}</code> — {status_txt}")
     else:
-        lines.append("Последняя проверка почты: ещё не выполнялась")
+        lines.append("📬 Последняя проверка: ещё не выполнялась")
 
     if last_notif_time:
-        lines.append(f"Последнее уведомление: «{last_notif_subj}» ({last_notif_time.strftime('%Y-%m-%d %H:%M:%S')})")
+        lines.append(f"🔔 Последнее уведомление: «<code>{last_notif_subj}</code>» (<code>{last_notif_time.strftime('%Y-%m-%d %H:%M:%S')}</code>)")
     else:
-        lines.append("Уведомлений пока не было")
+        lines.append("🔔 Уведомлений пока не было")
 
     send_telegram_message("\n".join(lines), chat_id=chat_id)
+
+
+def start_gmail_setup(chat_id, username):
+    """Запустить процесс настройки Gmail учетных данных."""
+    user_id = str(chat_id)
+    user_setup_state[user_id] = {"step": 1, "username": username}
+    save_json(USER_SETUP_STATE_FILE, user_setup_state)
+
+    send_telegram_message(
+        "📧 <b>Настройка Gmail</b>\n\n"
+        "Введите ваш Gmail-адрес (например: your.email@gmail.com):",
+        chat_id=chat_id
+    )
+
+
+def process_setup_step(chat_id, text, username):
+    """Обработать шаги настройки Gmail."""
+    user_id = str(chat_id)
+    state = user_setup_state.get(user_id, {})
+    step = state.get("step", 1)
+
+    if step == 1:
+        # Первый шаг: вводим email
+        email_account = text.strip()
+        if "@gmail.com" not in email_account:
+            send_telegram_message(
+                "❌ Пожалуйста, используйте Gmail адрес (должен содержать @gmail.com)",
+                chat_id=chat_id
+            )
+            return
+
+        user_setup_state[user_id] = {"step": 2, "email": email_account, "username": username}
+        save_json(USER_SETUP_STATE_FILE, user_setup_state)
+
+        send_telegram_message(
+            f"✅ Email сохранён: <code>{email_account}</code>\n\n"
+            "Теперь введите <b>пароль приложения Gmail</b>.\n\n"
+            "Как получить пароль приложения:\n"
+            "1. Откройте <a href='https://myaccount.google.com/security'>Google Account Security</a>\n"
+            "2. Включите двухфакторную аутентификацию (если еще не включена)\n"
+            "3. Вернитесь в Security и найдите 'App passwords'\n"
+            "4. Выберите приложение 'Mail' и устройство 'Windows Computer' (или любое)\n"
+            "5. Google сгенерирует пароль из 16 символов\n"
+            "6. Скопируйте этот пароль (без пробелов) и отправьте его боту",
+            chat_id=chat_id,
+            parse_mode="HTML"
+        )
+
+    elif step == 2:
+        # Второй шаг: вводим пароль приложения
+        app_password = text.strip().replace(" ", "")
+        email_account = state.get("email", "")
+
+        # Тестируем подключение
+        send_telegram_message("⏳ Проверяю учетные данные...", chat_id=chat_id)
+
+        ok, error = test_gmail_connection(email_account, app_password)
+
+        if ok:
+            # Сохраняем учетные данные
+            gmail_credentials[user_id] = {
+                "email": email_account,
+                "password": app_password,
+                "username": username
+            }
+            save_json(GMAIL_CREDENTIALS_FILE, gmail_credentials)
+
+            # Удаляем из состояния настройки
+            user_setup_state.pop(user_id, None)
+            save_json(USER_SETUP_STATE_FILE, user_setup_state)
+
+            send_telegram_message(
+                f"✅ <b>Настройка завершена!</b>\n\n"
+                f"📧 Почта: <code>{email_account}</code>\n\n"
+                "Бот начнет проверять вашу почту и отправлять уведомления всем подписчикам.\n\n"
+                "Команды:\n"
+                "/start - подписаться на уведомления\n"
+                "/stop - отписаться\n"
+                "/setup - изменить учетные данные\n"
+                "/status - статус бота (только админы)",
+                chat_id=chat_id
+            )
+            print(f"[SETUP] Пользователь @{username} ({email_account}) успешно настроен")
+
+        else:
+            send_telegram_message(
+                f"❌ <b>Ошибка подключения:</b>\n\n"
+                f"<code>{error}</code>\n\n"
+                "Проверьте:\n"
+                "✓ Правильность email и пароля\n"
+                "✓ Включен ли IMAP в Gmail (Настройки → Пересылка и POP/IMAP)\n"
+                "✓ Используете ли вы именно пароль приложения, а не обычный пароль\n\n"
+                "Попробуем заново. Введите email:",
+                chat_id=chat_id
+            )
+            user_setup_state[user_id] = {"step": 1, "username": username}
+            save_json(USER_SETUP_STATE_FILE, user_setup_state)
 
 
 def telegram_polling():
@@ -383,7 +498,18 @@ def telegram_polling():
                 from_user = message.get("from", {}) or {}
                 username = (from_user.get("username") or "").lower()
 
-                if text == "/start":
+                user_id = str(chat_id)
+
+                # Если пользователь находится в процессе настройки
+                if user_id in user_setup_state and not text.startswith("/"):
+                    process_setup_step(chat_id, text, username)
+                    continue
+
+                # Обработка команд
+                if text == "/setup":
+                    start_gmail_setup(chat_id, username)
+
+                elif text == "/start":
                     if not has_start_access(username):
                         send_telegram_message(
                             "⛔ Доступ к подписке ограничен. Обратитесь к администратору, "
@@ -395,19 +521,26 @@ def telegram_polling():
                         subscribers.add(chat_id)
                         save_json(SUBSCRIBERS_FILE, list(subscribers))
                     send_telegram_message(
-                        "Вы подписаны на уведомления о новых темах форума ✅\nЧтобы отписаться — /stop\nПроверить статус бота — /ping",
+                        "✅ Вы подписаны на уведомления о новых темах форума\n\n"
+                        "Команды:\n"
+                        "/setup - настроить свою почту\n"
+                        "/stop - отписаться\n"
+                        "/status - статус бота (только админы)",
                         chat_id=chat_id,
                     )
+
                 elif text == "/stop":
                     if chat_id in subscribers:
                         subscribers.discard(chat_id)
                         save_json(SUBSCRIBERS_FILE, list(subscribers))
-                    send_telegram_message("Вы отписаны от уведомлений ❌", chat_id=chat_id)
-                elif text == "/ping":
+                    send_telegram_message("❌ Вы отписаны от уведомлений", chat_id=chat_id)
+
+                elif text == "/status":
                     if not is_admin(username):
                         send_telegram_message("⛔ Команда доступна только администратору.", chat_id=chat_id)
                         continue
-                    handle_ping(chat_id)
+                    handle_status(chat_id)
+
                 elif text.startswith("/sell"):
                     if not is_admin(username):
                         send_telegram_message("⛔ Команда доступна только администратору.", chat_id=chat_id)
@@ -431,13 +564,27 @@ def telegram_polling():
 # ------------------- ЗАПУСК -------------------
 
 def main():
-    t = threading.Thread(target=telegram_polling, daemon=True)
-    t.start()
+    # Запускаем поток Telegram polling
+    tg_thread = threading.Thread(target=telegram_polling, daemon=True)
+    tg_thread.start()
 
-    print("Мониторинг почты запущен. Ожидание новых писем...")
-    while True:
-        check_mail()
-        time.sleep(POLL_INTERVAL)
+    # Запускаем поток проверки почты
+    mail_thread = threading.Thread(target=mail_monitor_thread, daemon=True)
+    mail_thread.start()
+
+    print("=" * 60)
+    print("🤖 Форум-мониторинг бот запущен")
+    print("=" * 60)
+    print("Администраторы могут использовать /status для просмотра информации")
+    print("Новые пользователи должны выполнить /setup для настройки Gmail")
+    print("=" * 60)
+
+    # Главный поток просто ждет
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("\n🛑 Бот остановлен")
 
 
 if __name__ == "__main__":
