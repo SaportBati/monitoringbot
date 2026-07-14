@@ -14,10 +14,17 @@
    спрятанную за кнопкой "Посмотреть эту тему".
 3. Рассылает эти данные всем подписчикам Telegram-бота.
 4. Параллельно слушает Telegram:
-     /start - подписаться на рассылку
-     /stop  - отписаться
-     /ping  - статус бота (аптайм, время последней проверки почты,
-              подключение к Gmail, число подписчиков)
+     /start      - подписаться на рассылку (только если пользователю
+                   разрешён доступ администратором)
+     /stop       - отписаться
+     /ping       - статус бота (аптайм, время последней проверки почты,
+                   подключение к Gmail, число подписчиков) — только для админов
+     /sell @user - (только для админов) выдать пользователю @user доступ
+                   к команде /start
+
+Администраторы (задаются по Telegram-username, без @): NehtoOtto, yisroelwork.
+Список пользователей, которым выдан доступ (через /sell), и список
+подписчиков хранятся в файлах в папке data/ и переживают перезапуск бота.
 
 Перед запуском:
 - впишите свой Gmail-адрес в EMAIL_ACCOUNT ниже
@@ -56,7 +63,7 @@ from bs4 import BeautifulSoup
 # ------------------- НАСТРОЙКИ -------------------
 
 IMAP_SERVER = "imap.gmail.com"
-EMAIL_ACCOUNT = "grebenkinmatveyvyceslacovi2007@gmail.com"          # <-- укажите свою почту
+EMAIL_ACCOUNT = "ВАШ_EMAIL@gmail.com"          # <-- укажите свою почту
 APP_PASSWORD = "ltdc girf btdu ihzs"           # пароль приложения Gmail
 BOT_TOKEN = "8808314870:AAHmQRtoaxcJXGQr1EdOBlHzIro20RzhFPw"
 
@@ -69,6 +76,12 @@ TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 DATA_DIR = "data"
 SUBSCRIBERS_FILE = os.path.join(DATA_DIR, "subscribers.json")
 PROCESSED_FILE = os.path.join(DATA_DIR, "processed.json")
+ALLOWED_FILE = os.path.join(DATA_DIR, "allowed_users.json")
+
+# Администраторы бота (Telegram-username без "@", в нижнем регистре).
+# У админов всегда есть доступ к /start, /ping и они могут выдавать
+# доступ другим пользователям через /sell @username.
+ADMIN_USERNAMES = {"nehtootto", "yisroelwork"}
 
 os.makedirs(DATA_DIR, exist_ok=True)
 
@@ -99,6 +112,9 @@ def save_json(path, data):
 
 subscribers = set(load_json(SUBSCRIBERS_FILE, []))
 processed_ids = set(load_json(PROCESSED_FILE, []))
+# Username'ы (в нижнем регистре, без "@"), которым админ выдал доступ
+# к /start командой /sell @username.
+allowed_users = set(u.lower() for u in load_json(ALLOWED_FILE, []))
 
 # ------------------- РАБОТА С ПОЧТОЙ -------------------
 
@@ -272,6 +288,16 @@ def check_mail():
 
 # ------------------- TELEGRAM -------------------
 
+def is_admin(username):
+    """username ожидается уже в нижнем регистре, без '@'."""
+    return bool(username) and username in ADMIN_USERNAMES
+
+
+def has_start_access(username):
+    """Доступ к /start есть у админов и у тех, кому его выдали через /sell."""
+    return is_admin(username) or (bool(username) and username in allowed_users)
+
+
 def send_telegram_message(text, chat_id=None):
     targets = [chat_id] if chat_id else list(subscribers)
     if not targets:
@@ -353,9 +379,18 @@ def telegram_polling():
                     continue
 
                 chat_id = message["chat"]["id"]
-                text = message.get("text", "")
+                text = message.get("text", "").strip()
+                from_user = message.get("from", {}) or {}
+                username = (from_user.get("username") or "").lower()
 
                 if text == "/start":
+                    if not has_start_access(username):
+                        send_telegram_message(
+                            "⛔ Доступ к подписке ограничен. Обратитесь к администратору, "
+                            "чтобы вам выдали доступ.",
+                            chat_id=chat_id,
+                        )
+                        continue
                     if chat_id not in subscribers:
                         subscribers.add(chat_id)
                         save_json(SUBSCRIBERS_FILE, list(subscribers))
@@ -369,7 +404,25 @@ def telegram_polling():
                         save_json(SUBSCRIBERS_FILE, list(subscribers))
                     send_telegram_message("Вы отписаны от уведомлений ❌", chat_id=chat_id)
                 elif text == "/ping":
+                    if not is_admin(username):
+                        send_telegram_message("⛔ Команда доступна только администратору.", chat_id=chat_id)
+                        continue
                     handle_ping(chat_id)
+                elif text.startswith("/sell"):
+                    if not is_admin(username):
+                        send_telegram_message("⛔ Команда доступна только администратору.", chat_id=chat_id)
+                        continue
+                    parts = text.split(maxsplit=1)
+                    if len(parts) < 2 or not parts[1].strip():
+                        send_telegram_message("Используйте: /sell @username", chat_id=chat_id)
+                        continue
+                    target = parts[1].strip().lstrip("@").lower()
+                    if target in allowed_users:
+                        send_telegram_message(f"Пользователь @{target} уже имеет доступ к /start.", chat_id=chat_id)
+                    else:
+                        allowed_users.add(target)
+                        save_json(ALLOWED_FILE, list(allowed_users))
+                        send_telegram_message(f"✅ Пользователю @{target} выдан доступ к /start.", chat_id=chat_id)
 
         except Exception as e:
             print(f"[TG] Ошибка polling: {e}")
