@@ -54,6 +54,8 @@ def _ensure_package(pip_name, import_name=None):
 for _pip_name, _import_name in [("requests", "requests"), ("beautifulsoup4", "bs4")]:
     _ensure_package(_pip_name, _import_name)
 
+import base64
+import re
 import imaplib
 import email
 from email.header import decode_header
@@ -226,6 +228,25 @@ def extract_topic_link(html_body):
     return None
 
 
+def decode_imap_utf7(name):
+    """Декодирует имя папки IMAP (modified UTF-7) в обычный читаемый текст."""
+    if not name:
+        return name
+
+    def _decode_chunk(m):
+        chunk = m.group(1)
+        if chunk == "":
+            return "&"
+        b64 = chunk.replace(",", "/")
+        b64 += "=" * (-len(b64) % 4)
+        try:
+            return base64.b64decode(b64).decode("utf-16-be")
+        except Exception:
+            return m.group(0)
+
+    return re.sub(r"&([^-]*)-", _decode_chunk, name)
+
+
 def get_all_folders(imap):
     """Получить список всех папок из IMAP."""
     status, folders = imap.list()
@@ -301,7 +322,7 @@ def check_mail_for_user(user_id, email_account, app_password, username, target_f
         notify_debug(
             debug_admins,
             f"🔍 [DEBUG {check_started_at.strftime('%H:%M:%S')}] Начата проверка почты "
-            f"@{username} (<code>{email_account}</code>) в папке <b>{target_folder}</b>",
+            f"@{username} (<code>{email_account}</code>) в папке <b>{decode_imap_utf7(target_folder)}</b>",
         )
 
     try:
@@ -657,7 +678,7 @@ def handle_ping(chat_id, username):
     if ok:
         folder = creds.get("folder", "INBOX")
         send_telegram_message(
-            f"✅ <b>Почта подключена и работает</b>\n📧 <code>{creds['email']}</code>\n📁 Папка: <code>{folder}</code>",
+            f"✅ <b>Почта подключена и работает</b>\n📧 <code>{creds['email']}</code>\n📁 Папка: <code>{decode_imap_utf7(folder)}</code>",
             chat_id=chat_id,
         )
     else:
@@ -686,7 +707,7 @@ def handle_debug(chat_id):
     for i, (uid, creds) in enumerate(gmail_credentials.items(), start=1):
         uname = creds.get("username", "unknown")
         folder = creds.get("folder", "INBOX")
-        lines.append(f"{i}. @{uname} (<code>{creds.get('email', '')}</code>) → {folder}")
+        lines.append(f"{i}. @{uname} (<code>{creds.get('email', '')}</code>) → {decode_imap_utf7(folder)}")
         idx_map[str(i)] = uid
 
     debug_setup_state[admin_id] = {"idx_map": idx_map}
@@ -727,7 +748,7 @@ def process_debug_selection(chat_id, text):
     uname = creds.get("username", "unknown")
     folder = creds.get("folder", "INBOX")
     send_telegram_message(
-        f"✅ Режим отладки включен.\n👀 Мониторю: @{uname} ({folder})\n\n"
+        f"✅ Режим отладки включен.\n👀 Мониторю: @{uname} ({decode_imap_utf7(folder)})\n\n"
         "Используйте /undebug, чтобы выключить.",
         chat_id=chat_id,
     )
@@ -857,7 +878,7 @@ def process_setup_step(chat_id, text, username):
         # Показываем список папок
         lines = ["📁 <b>Выберите папку для мониторинга</b>", "Отправьте номер:"]
         for i, folder in enumerate(folders, start=1):
-            lines.append(f"{i}. {folder}")
+            lines.append(f"{i}. {decode_imap_utf7(folder)}")
 
         send_telegram_message("\n".join(lines), chat_id=chat_id)
 
@@ -893,7 +914,7 @@ def process_setup_step(chat_id, text, username):
         send_telegram_message(
             f"✅ <b>Настройка завершена!</b>\n\n"
             f"📧 Почта: <code>{email_account}</code>\n"
-            f"📁 Папка: <code>{selected_folder}</code>\n\n"
+            f"📁 Папка: <code>{decode_imap_utf7(selected_folder)}</code>\n\n"
             "Бот начнет проверять вашу почту и отправлять уведомления всем подписчикам.\n\n"
             "Команды:\n"
             "/start - подписаться на уведомления\n"
