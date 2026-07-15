@@ -1,7 +1,7 @@
 """
 Асинхронный мониторинг Gmail (IMAP IDLE) + Telegram-бот.
 Полностью на asyncio: aioimaplib вместо imaplib, aiohttp вместо requests.
-2
+3
 Функциональность сохранена:
 /setup /start /stop /ping /status /sell /debug /undebug
 Хранение — те же JSON-файлы. Добавление пользователя через /setup
@@ -220,7 +220,7 @@ def _parse_folder_list(raw_lines):
 
 
 async def get_all_folders(imap):
-    resp = await imap.list("", "*")
+    resp = await imap.list('""', '"*"')
     if resp.result != "OK":
         return []
     return _parse_folder_list(resp.lines)
