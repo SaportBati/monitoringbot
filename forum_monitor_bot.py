@@ -1,7 +1,7 @@
 """
 Мониторинг Gmail (IMAP) на предмет писем о новых темах форума
 и рассылка уведомлений подписчикам Telegram-бота.
-2
+3
 ВЕРСИЯ С ПОДДЕРЖКОЙ МНОГОПОЛЬЗОВАТЕЛЬСКОЙ НАСТРОЙКИ И АСИНХРОННОЙ АРХИТЕКТУРЫ:
 Каждый пользователь сам настраивает свои учетные данные Gmail через команду /setup
 
@@ -57,7 +57,6 @@ from bs4 import BeautifulSoup
 # Импорт aiogram и aioimaplib после установки
 import aiogram
 from aiogram import Bot, Dispatcher, types, filters
-from aiogram.utils import executor
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
 from aiogram.dispatcher import FSMContext
 
@@ -1154,7 +1153,7 @@ async def echo_handler(message: types.Message):
             # Неизвестная команда
             await message.answer("Неизвестная команда. Используйте /start для справки.")
     else:
-        # Игнорируем非 текстовые сообщения
+        # Игнорируем не текстовые сообщения
         pass
 # ------------------- LIFE CYCLE HOOKS -------------------
 
