@@ -1,6 +1,7 @@
 """
 Мониторинг Gmail (IMAP) на предмет писем о новых темах форума
 и рассылка уведомлений подписчикам Telegram-бота.
+1
 
 ВЕРСИЯ С ПОДДЕРЖКОЙ МНОГОПОЛЬЗОВАТЕЛЬСКОЙ НАСТРОЙКИ:
 Каждый пользователь сам настраивает свои учетные данные Gmail через команду /setup
@@ -245,6 +246,48 @@ def decode_imap_utf7(name):
             return m.group(0)
 
     return re.sub(r"&([^-]*)-", _decode_chunk, name)
+
+
+def find_best_folder(email_account, app_password, folders):
+    """Ищет папку с самым свежим письмом, подходящим под SUBJECT_FILTER."""
+    best_folder = None
+    best_date = None
+    try:
+        imap = imaplib.IMAP4_SSL(IMAP_SERVER)
+        imap.login(email_account, app_password)
+        for folder in folders:
+            try:
+                status, _ = imap.select(f'"{folder}"', readonly=True)
+                if status != "OK":
+                    continue
+                status, data = imap.uid("search", None, "ALL")
+                if status != "OK" or not data or not data[0]:
+                    continue
+                uids = sorted(int(x) for x in data[0].split())[-15:]
+                for uid in uids:
+                    status, hdata = imap.uid(
+                        "fetch", str(uid), "(BODY.PEEK[HEADER.FIELDS (SUBJECT DATE)])"
+                    )
+                    if status != "OK" or not hdata or hdata[0] is None:
+                        continue
+                    hmsg = email.message_from_bytes(hdata[0][1])
+                    subject = decode_mime_words(hmsg.get("Subject", ""))
+                    if SUBJECT_FILTER.lower() not in subject.lower():
+                        continue
+                    date_raw = hmsg.get("Date")
+                    try:
+                        msg_date = email.utils.parsedate_to_datetime(date_raw)
+                    except Exception:
+                        msg_date = None
+                    if msg_date and (best_date is None or msg_date > best_date):
+                        best_date = msg_date
+                        best_folder = folder
+            except Exception:
+                continue
+        imap.logout()
+    except Exception as e:
+        print(f"[IMAP] Ошибка поиска лучшей папки для {email_account}: {e}")
+    return best_folder
 
 
 def get_all_folders(imap):
@@ -879,6 +922,11 @@ def process_setup_step(chat_id, text, username):
         lines = ["📁 <b>Выберите папку для мониторинга</b>", "Отправьте номер:"]
         for i, folder in enumerate(folders, start=1):
             lines.append(f"{i}. {decode_imap_utf7(folder)}")
+
+        best_folder = find_best_folder(email_account, app_password, folders)
+        if best_folder:
+            lines.append("")
+            lines.append(f"💡 Похоже, вам нужна папка: <b>{decode_imap_utf7(best_folder)}</b>")
 
         send_telegram_message("\n".join(lines), chat_id=chat_id)
 
