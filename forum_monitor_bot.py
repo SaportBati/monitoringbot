@@ -1,7 +1,7 @@
 """
 Мониторинг Gmail (IMAP) на предмет писем о новых темах форума
 и рассылка уведомлений подписчикам Telegram-бота.
-5
+7
 ВЕРСИЯ С ПОДДЕРЖКОЙ МНОГОПОЛЬЗОВАТЕЛЬСКОЙ НАСТРОЙКИ:
 Каждый пользователь сам настраивает свои учетные данные Gmail через команду /setup
 
@@ -559,33 +559,42 @@ def mail_monitor_thread():
     
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         while True:
-            futures = {}
-            
-            # Запускаем задачи для всех пользователей
-            for user_id_str, creds in gmail_credentials.items():
-                try:
-                    target_folder = creds.get("folder", "INBOX")
-                    future = executor.submit(
-                        run_check_with_status,
-                        user_id_str,
-                        creds["email"],
-                        creds["password"],
-                        creds.get("username", "unknown"),
-                        target_folder
-                    )
-                    futures[future] = user_id_str
-                except Exception as e:
-                    print(f"[ERROR] Ошибка при запуске проверки пользователя {user_id_str}: {e}")
-            
-            # Ждём завершения всех задач или timeout
-            if futures:
-                for future in as_completed(futures, timeout=POLL_INTERVAL):
+            try:
+                futures = {}
+
+                # Запускаем задачи для всех пользователей
+                for user_id_str, creds in gmail_credentials.items():
                     try:
-                        future.result()
+                        target_folder = creds.get("folder", "INBOX")
+                        future = executor.submit(
+                            run_check_with_status,
+                            user_id_str,
+                            creds["email"],
+                            creds["password"],
+                            creds.get("username", "unknown"),
+                            target_folder
+                        )
+                        futures[future] = user_id_str
                     except Exception as e:
-                        user_id = futures[future]
-                        print(f"[ERROR] Ошибка при проверке пользователя {user_id}: {e}")
-            
+                        print(f"[ERROR] Ошибка при запуске проверки пользователя {user_id_str}: {e}")
+
+                # Ждём завершения всех задач или timeout
+                if futures:
+                    try:
+                        for future in as_completed(futures, timeout=POLL_INTERVAL):
+                            try:
+                                future.result()
+                            except Exception as e:
+                                user_id = futures[future]
+                                print(f"[ERROR] Ошибка при проверке пользователя {user_id}: {e}")
+                    except TimeoutError:
+                        # Не все проверки успели завершиться за POLL_INTERVAL — это нормально
+                        # при медленном IMAP, они доработают в фоне. Поток не должен из-за этого падать.
+                        print(f"[WARN] Не все проверки почты успели завершиться за {POLL_INTERVAL}с, продолжаем")
+            except Exception as e:
+                # Любая непредвиденная ошибка не должна убивать поток мониторинга насовсем
+                print(f"[ERROR] mail_monitor_thread: {e}")
+
             time.sleep(POLL_INTERVAL)
 
 # ------------------- TELEGRAM -------------------
