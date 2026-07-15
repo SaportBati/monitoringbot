@@ -1,7 +1,7 @@
 """
 Мониторинг Gmail (IMAP) на предмет писем о новых темах форума
 и рассылка уведомлений подписчикам Telegram-бота.
-4
+5
 ВЕРСИЯ С ПОДДЕРЖКОЙ МНОГОПОЛЬЗОВАТЕЛЬСКОЙ НАСТРОЙКИ:
 Каждый пользователь сам настраивает свои учетные данные Gmail через команду /setup
 
@@ -104,6 +104,10 @@ LAST_NOTIFICATION_TIME = None
 ACTIVE_CHECKS = 0  # сколько в данный момент выполняется проверок
 
 state_lock = threading.Lock()
+
+# Живой статус подключения по каждому пользователю: {user_id: True/False}
+# True — прямо сейчас идёт проверка почты (значит соединение активно).
+user_active_checks = {}
 
 # ------------------- ХРАНИЛИЩЕ -------------------
 
@@ -535,6 +539,17 @@ def check_mail_for_user(user_id, email_account, app_password, username, target_f
         )
 
 
+def run_check_with_status(user_id, email_account, app_password, username, target_folder):
+    """Обёртка над check_mail_for_user: помечает соединение как активное на время проверки."""
+    with state_lock:
+        user_active_checks[user_id] = True
+    try:
+        check_mail_for_user(user_id, email_account, app_password, username, target_folder)
+    finally:
+        with state_lock:
+            user_active_checks[user_id] = False
+
+
 def mail_monitor_thread():
     """
     Фоновый поток, проверяющий почту всех пользователей ПАРАЛЛЕЛЬНО.
@@ -551,7 +566,7 @@ def mail_monitor_thread():
                 try:
                     target_folder = creds.get("folder", "INBOX")
                     future = executor.submit(
-                        check_mail_for_user,
+                        run_check_with_status,
                         user_id_str,
                         creds["email"],
                         creds["password"],
@@ -696,7 +711,10 @@ def handle_debug(chat_id):
     for i, (uid, creds) in enumerate(gmail_credentials.items(), start=1):
         uname = creds.get("username", "unknown")
         folder = creds.get("folder", "INBOX")
-        lines.append(f"{i}. @{uname} (<code>{creds.get('email', '')}</code>) → {folder}")
+        with state_lock:
+            is_active = bool(user_active_checks.get(uid))
+        status_icon = "🟢" if is_active else "⚪"
+        lines.append(f"{i}. {status_icon} @{uname} (<code>{creds.get('email', '')}</code>) → {folder}")
         idx_map[str(i)] = uid
 
     debug_setup_state[admin_id] = {"idx_map": idx_map}
