@@ -77,6 +77,7 @@ PROCESSED_FILE = os.path.join(DATA_DIR, "processed.json")
 ALLOWED_FILE = os.path.join(DATA_DIR, "allowed_users.json")
 GMAIL_CREDENTIALS_FILE = os.path.join(DATA_DIR, "gmail_credentials.json")
 USER_SETUP_STATE_FILE = os.path.join(DATA_DIR, "user_setup_state.json")
+FOLDER_STATE_FILE = os.path.join(DATA_DIR, "folder_state.json")
 
 # Администраторы бота (Telegram-username без "@", в нижнем регистре).
 ADMIN_USERNAMES = {"nehtootto", "yisroelwork"}
@@ -123,6 +124,10 @@ gmail_credentials = load_json(GMAIL_CREDENTIALS_FILE, {})
 
 # Состояние настройки пользователей: {user_id: {"step": 1 или 2, "email": "..."}}
 user_setup_state = load_json(USER_SETUP_STATE_FILE, {})
+
+# Состояние UID-синхронизации по папкам: {user_id: {folder: {"uidvalidity": int, "last_uid": int}}}
+folder_state = load_json(FOLDER_STATE_FILE, {})
+folder_state_lock = threading.Lock()
 
 # ------------------- РЕЖИМ ОТЛАДКИ (/debug, /undebug) -------------------
 
@@ -276,6 +281,8 @@ def check_mail_for_user(user_id, email_account, app_password, username):
     debug_total_scanned = 0
     debug_total_matched = 0
 
+    user_folder_state = folder_state.setdefault(user_id, {})
+
     for folder in folders:
         try:
             status, _ = imap.select(f'"{folder}"', readonly=True)
@@ -288,43 +295,99 @@ def check_mail_for_user(user_id, email_account, app_password, username):
                 notify_debug(debug_admins, f"⚠️ [DEBUG] Папка «{folder}»: ошибка select() → {e}")
             continue
 
+        # UIDVALIDITY приходит как untagged-ответ на SELECT. Если он изменился
+        # (или папку видим впервые), все ранее сохранённые UID для этой папки
+        # становятся не валидны — сервер вправе перевыдать их заново.
         try:
-            status, data = imap.search(None, "ALL")
-        except Exception as e:
+            uidval_raw = imap.untagged_responses.get("UIDVALIDITY")
+            current_uidvalidity = int(uidval_raw[-1]) if uidval_raw else None
+        except Exception:
+            current_uidvalidity = None
+
+        saved = user_folder_state.get(folder)
+        is_fresh_folder = (
+            saved is None
+            or current_uidvalidity is None
+            or saved.get("uidvalidity") != current_uidvalidity
+        )
+
+        if is_fresh_folder:
+            # Впервые видим папку (или сменился UIDVALIDITY): делаем один
+            # полный SEARCH ALL, но проверяем только последние FOLDER_SCAN_LIMIT
+            # писем, как и раньше — дальше переходим на инкрементальный UID-поиск.
+            try:
+                status, data = imap.uid("search", None, "ALL")
+            except Exception as e:
+                if debug_admins:
+                    notify_debug(debug_admins, f"⚠️ [DEBUG] Папка «{folder}»: ошибка uid search(ALL) → {e}")
+                continue
+            if status != "OK" or not data or not data[0]:
+                if debug_admins:
+                    notify_debug(debug_admins, f"📁 [DEBUG] Папка «{folder}»: писем нет (первичная инициализация)")
+                user_folder_state[folder] = {"uidvalidity": current_uidvalidity, "last_uid": 0}
+                continue
+
+            all_uids = sorted(int(x) for x in data[0].split())
+            uids_to_check = all_uids[-FOLDER_SCAN_LIMIT:]
+            max_uid_in_folder = all_uids[-1]
+
             if debug_admins:
-                notify_debug(debug_admins, f"⚠️ [DEBUG] Папка «{folder}»: ошибка search() → {e}")
-            continue
-        if status != "OK" or not data or not data[0]:
+                notify_debug(
+                    debug_admins,
+                    f"📁 [DEBUG] Папка «{folder}»: первичная инициализация (UIDVALIDITY={current_uidvalidity}), "
+                    f"всего писем {len(all_uids)}, будет проверено последних {len(uids_to_check)}",
+                )
+        else:
+            last_uid = saved.get("last_uid", 0)
+            try:
+                status, data = imap.uid("search", None, f"{last_uid + 1}:*")
+            except Exception as e:
+                if debug_admins:
+                    notify_debug(debug_admins, f"⚠️ [DEBUG] Папка «{folder}»: ошибка uid search(инкремент) → {e}")
+                continue
+
+            candidate_uids = []
+            if status == "OK" and data and data[0]:
+                candidate_uids = [int(x) for x in data[0].split()]
+
+            # Некоторые серверы на диапазон "N:*", где N больше максимального
+            # UID в папке, по спецификации всё равно возвращают последний UID.
+            # Отфильтровываем всё, что не строго больше last_uid.
+            uids_to_check = sorted(u for u in candidate_uids if u > last_uid)
+            max_uid_in_folder = max(uids_to_check) if uids_to_check else last_uid
+
             if debug_admins:
-                notify_debug(debug_admins, f"📁 [DEBUG] Папка «{folder}»: search() → {status}, писем нет")
+                notify_debug(
+                    debug_admins,
+                    f"📁 [DEBUG] Папка «{folder}»: инкрементальная проверка от UID {last_uid + 1}, "
+                    f"новых писем: {len(uids_to_check)}",
+                )
+
+        if not uids_to_check:
+            user_folder_state[folder] = {
+                "uidvalidity": current_uidvalidity,
+                "last_uid": max(max_uid_in_folder, saved.get("last_uid", 0) if saved else 0),
+            }
             continue
 
-        ids = data[0].split()
-
-        if debug_admins:
-            notify_debug(
-                debug_admins,
-                f"📁 [DEBUG] Папка «{folder}»: всего писем {len(ids)}, "
-                f"будет проверено последних {min(len(ids), FOLDER_SCAN_LIMIT)}",
-            )
-
-        for eid in ids[-FOLDER_SCAN_LIMIT:]:
+        for uid in uids_to_check:
+            uid_str = str(uid)
             try:
                 # Сначала лёгкий запрос: только заголовки (тема + Message-ID),
                 # без тела письма и вложений. Это на порядки быстрее, чем
                 # качать письмо целиком для каждого сообщения на каждом цикле.
-                status, header_data = imap.fetch(
-                    eid, "(BODY.PEEK[HEADER.FIELDS (SUBJECT MESSAGE-ID)])"
+                status, header_data = imap.uid(
+                    "fetch", uid_str, "(BODY.PEEK[HEADER.FIELDS (SUBJECT MESSAGE-ID)])"
                 )
                 if status != "OK" or not header_data or header_data[0] is None:
                     if debug_admins:
-                        notify_debug(debug_admins, f"⚠️ [DEBUG] fetch header({eid.decode()}) → {status}, пусто")
+                        notify_debug(debug_admins, f"⚠️ [DEBUG] fetch header(UID {uid_str}) → {status}, пусто")
                     continue
 
                 header_bytes = header_data[0][1]
                 header_msg = email.message_from_bytes(header_bytes)
 
-                message_id = f"{user_id}-{header_msg.get('Message-ID') or f'{folder}-{eid.decode()}'}"
+                message_id = f"{user_id}-{header_msg.get('Message-ID') or f'{folder}-UID{uid_str}'}"
                 subject = decode_mime_words(header_msg.get("Subject", ""))
                 debug_total_scanned += 1
 
@@ -345,10 +408,10 @@ def check_mail_for_user(user_id, email_account, app_password, username):
 
                 # Только теперь, для реально нового и подходящего письма,
                 # качаем его целиком, чтобы достать ссылку из HTML.
-                status, msg_data = imap.fetch(eid, "(RFC822)")
+                status, msg_data = imap.uid("fetch", uid_str, "(RFC822)")
                 if status != "OK" or not msg_data or msg_data[0] is None:
                     if debug_admins:
-                        notify_debug(debug_admins, f"⚠️ [DEBUG] fetch full({eid.decode()}) → {status}, пусто")
+                        notify_debug(debug_admins, f"⚠️ [DEBUG] fetch full(UID {uid_str}) → {status}, пусто")
                     continue
 
                 raw_email = msg_data[0][1]
@@ -386,12 +449,19 @@ def check_mail_for_user(user_id, email_account, app_password, username):
                 print(f"[MAIL] ({username}) Ошибка обработки письма: {e}")
                 continue
 
+        user_folder_state[folder] = {
+            "uidvalidity": current_uidvalidity,
+            "last_uid": max(max_uid_in_folder, saved.get("last_uid", 0) if saved else 0),
+        }
+
     try:
         imap.logout()
     except Exception:
         pass
 
     save_json(PROCESSED_FILE, list(processed_ids))
+    with folder_state_lock:
+        save_json(FOLDER_STATE_FILE, folder_state)
 
     with state_lock:
         LAST_CHECK_TIME = datetime.datetime.now()
