@@ -1,7 +1,7 @@
 """
 Асинхронный мониторинг Gmail (IMAP IDLE) + Telegram-бот.
 Полностью на asyncio: aioimaplib вместо imaplib, aiohttp вместо requests.
-
+2
 Функциональность сохранена:
 /setup /start /stop /ping /status /sell /debug /undebug
 Хранение — те же JSON-файлы. Добавление пользователя через /setup
@@ -187,6 +187,18 @@ def extract_topic_link(html_body):
         if "Посмотреть эту тему" in a.get_text(strip=True):
             return a.get("href")
     return None
+
+
+def imap_utf7_decode(s):
+    import re, base64
+    def _dec(m):
+        b64 = m.group(1)
+        if b64 == "":
+            return "&"
+        b64 = b64.replace(",", "/")
+        b64 += "=" * (-len(b64) % 4)
+        return base64.b64decode(b64).decode("utf-16-be")
+    return re.sub(r"&([^-]*)-", _dec, s)
 
 
 def _parse_folder_list(raw_lines):
@@ -708,7 +720,7 @@ async def process_setup_step(chat_id, text, username):
 
             lines = ["📂 <b>Выберите папку для мониторинга</b>", "Отправьте номер:"]
             for i, f in idx_map.items():
-                lines.append(f"{i}. {f}")
+                lines.append(f"{i}. {imap_utf7_decode(f)}")
             await send_telegram_message("\n".join(lines), chat_id=chat_id)
         else:
             await send_telegram_message(
