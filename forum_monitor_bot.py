@@ -5,29 +5,34 @@
 ВЕРСИЯ С ПОДДЕРЖКОЙ МНОГОПОЛЬЗОВАТЕЛЬСКОЙ НАСТРОЙКИ:
 Каждый пользователь сам настраивает свои учетные данные Gmail через команду /setup
 
+✨ ОПТИМИЗАЦИЯ:
+- Параллельная проверка почты для разных пользователей (ThreadPoolExecutor)
+- Проверка только выбранной папки вместо всех папок
+- Выбор папки во время /setup (шаг 3)
+
 Скрипт полностью самодостаточен: при первом запуске сам ставит
 недостающие библиотеки (requests, beautifulsoup4), поэтому для
 хостинга достаточно одного этого файла.
 
 Что делает скрипт:
-1. При команде /setup пользователь вводит свой Gmail и пароль приложения
-2. Раз в POLL_INTERVAL секунд проверяет ВСЕ папки почты всех пользователей,
-   ищет письма с темой, содержащей SUBJECT_FILTER
-3. Из найденного письма достаёт заголовок темы и ссылку,
-   спрятанную за кнопкой "Посмотреть эту тему"
+1. При команде /setup пользователь вводит:
+   - Email Gmail
+   - Пароль приложения
+   - Папку, из которой получать уведомления (выбор из списка)
+2. Раз в POLL_INTERVAL секунд проверяет ТОЛЬКО выбранные папки всех пользователей
+   (параллельно для разных пользователей)
+3. Из найденного письма достаёт заголовок темы и ссылку
 4. Рассылает эти данные подписчикам
-5. Параллельно слушает Telegram:
-     /setup      - настроить/изменить учетные данные Gmail
+5. Параллельно слушает Telegram (все команды как раньше)
+
+Команды:
+     /setup      - настроить/изменить учетные данные Gmail (с выбором папки)
      /start      - подписаться на рассылку
      /stop       - отписаться
-     /ping       - проверить подключение к своей почте (доступно всем с доступом)
+     /ping       - проверить подключение к своей почте
      /status     - показать статус бота (только для админов)
      /sell @user - (только для админов) выдать пользователю @user доступ
-     /debug      - (только для админов) включить режим отладки: бот присылает
-                   в этот чат все ответы по запросам и уведомляет о каждой
-                   проверке почты (раз в POLL_INTERVAL сек). После команды
-                   нужно выбрать, за каким настроенным пользователем следить
-                   (или выбрать "0" — следить за всеми)
+     /debug      - (только для админов) включить режим отладки
      /undebug    - (только для админов) выключить режим отладки
 
 Администраторы (задаются по Telegram-username, без @): NehtoOtto, yisroelwork.
@@ -59,6 +64,7 @@ import threading
 import datetime
 import requests
 from bs4 import BeautifulSoup
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ------------------- НАСТРОЙКИ -------------------
 
@@ -68,6 +74,7 @@ BOT_TOKEN = "8808314870:AAHmQRtoaxcJXGQr1EdOBlHzIro20RzhFPw"
 POLL_INTERVAL = 5                # как часто проверять почту, секунд
 SUBJECT_FILTER = "новая тема в отслеживаемом форуме"
 FOLDER_SCAN_LIMIT = 30           # сколько последних писем в каждой папке проверять
+MAX_WORKERS = 5                  # максимум одновременных проверок почты (для ThreadPoolExecutor)
 
 TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
@@ -78,6 +85,7 @@ ALLOWED_FILE = os.path.join(DATA_DIR, "allowed_users.json")
 GMAIL_CREDENTIALS_FILE = os.path.join(DATA_DIR, "gmail_credentials.json")
 USER_SETUP_STATE_FILE = os.path.join(DATA_DIR, "user_setup_state.json")
 FOLDER_STATE_FILE = os.path.join(DATA_DIR, "folder_state.json")
+FOLDERS_CACHE_FILE = os.path.join(DATA_DIR, "folders_cache.json")  # кэш списка папок
 
 # Администраторы бота (Telegram-username без "@", в нижнем регистре).
 ADMIN_USERNAMES = {"nehtootto", "yisroelwork"}
@@ -92,6 +100,7 @@ LAST_CHECK_OK = None
 LAST_CHECK_ERROR = ""
 LAST_NOTIFICATION_SUBJECT = ""
 LAST_NOTIFICATION_TIME = None
+ACTIVE_CHECKS = 0  # сколько в данный момент выполняется проверок
 
 state_lock = threading.Lock()
 
@@ -119,24 +128,24 @@ subscribers = set(load_json(SUBSCRIBERS_FILE, []))
 processed_ids = set(load_json(PROCESSED_FILE, []))
 allowed_users = set(u.lower() for u in load_json(ALLOWED_FILE, []))
 
-# Хранилище учетных данных: {user_id: {"email": "...", "password": "...", "username": "..."}}
+# Хранилище учетных данных: {user_id: {"email": "...", "password": "...", "username": "...", "folder": "..."}}
 gmail_credentials = load_json(GMAIL_CREDENTIALS_FILE, {})
 
-# Состояние настройки пользователей: {user_id: {"step": 1 или 2, "email": "..."}}
+# Состояние настройки пользователей: {user_id: {"step": 1/2/3, "email": "...", "folder": "..."}}
 user_setup_state = load_json(USER_SETUP_STATE_FILE, {})
 
 # Состояние UID-синхронизации по папкам: {user_id: {folder: {"uidvalidity": int, "last_uid": int}}}
 folder_state = load_json(FOLDER_STATE_FILE, {})
 folder_state_lock = threading.Lock()
 
+# Кэш списка папок: {email: ["INBOX", "Sent", ...]} (время жизни: 1 час)
+folders_cache = load_json(FOLDERS_CACHE_FILE, {})
+folders_cache_time = {}  # {email: timestamp}
+FOLDERS_CACHE_TTL = 3600  # кэш актуален 1 час
+
 # ------------------- РЕЖИМ ОТЛАДКИ (/debug, /undebug) -------------------
 
-# Кто из админов сейчас в режиме отладки и за каким пользователем следит.
-# {admin_chat_id (str): target_user_id (str) или None (значит "все пользователи")}
 debug_targets = {}
-
-# Состояние выбора пользователя после команды /debug (пока админ не ответил номером).
-# {admin_chat_id (str): {"idx_map": {"1": user_id, "2": user_id, ...}}}
 debug_setup_state = {}
 
 
@@ -218,6 +227,7 @@ def extract_topic_link(html_body):
 
 
 def get_all_folders(imap):
+    """Получить список всех папок из IMAP."""
     status, folders = imap.list()
     result = []
     if status == "OK":
@@ -231,6 +241,37 @@ def get_all_folders(imap):
     return result
 
 
+def get_folders_for_user(email_account, app_password):
+    """Получить список папок с кэшированием."""
+    global folders_cache, folders_cache_time
+    
+    now = time.time()
+    
+    # Проверяем кэш
+    if email_account in folders_cache:
+        cache_time = folders_cache_time.get(email_account, 0)
+        if now - cache_time < FOLDERS_CACHE_TTL:
+            return folders_cache[email_account]
+    
+    # Кэш мертв или его нет — получаем список папок
+    try:
+        imap = imaplib.IMAP4_SSL(IMAP_SERVER)
+        imap.login(email_account, app_password)
+        folders = get_all_folders(imap)
+        imap.logout()
+        
+        # Сохраняем в кэш
+        folders_cache[email_account] = folders
+        folders_cache_time[email_account] = now
+        save_json(FOLDERS_CACHE_FILE, folders_cache)
+        
+        return folders
+    except Exception as e:
+        print(f"[IMAP] Ошибка получения папок для {email_account}: {e}")
+        # Если даже кэш мертв, возвращаем пустой список
+        return folders_cache.get(email_account, [])
+
+
 def test_gmail_connection(email_account, app_password):
     """Быстрая проверка, что логин по IMAP проходит."""
     try:
@@ -242,19 +283,25 @@ def test_gmail_connection(email_account, app_password):
         return False, str(e)
 
 
-def check_mail_for_user(user_id, email_account, app_password, username):
-    """Проверяет почту для конкретного пользователя."""
+def check_mail_for_user(user_id, email_account, app_password, username, target_folder):
+    """
+    Проверяет почту для конкретного пользователя.
+    Теперь проверяет только выбранную target_folder вместо всех папок.
+    """
     global LAST_CHECK_TIME, LAST_CHECK_OK, LAST_CHECK_ERROR
-    global LAST_NOTIFICATION_SUBJECT, LAST_NOTIFICATION_TIME
+    global LAST_NOTIFICATION_SUBJECT, LAST_NOTIFICATION_TIME, ACTIVE_CHECKS
 
     debug_admins = get_debug_admins(user_id)
     check_started_at = datetime.datetime.now()
+
+    with state_lock:
+        ACTIVE_CHECKS += 1
 
     if debug_admins:
         notify_debug(
             debug_admins,
             f"🔍 [DEBUG {check_started_at.strftime('%H:%M:%S')}] Начата проверка почты "
-            f"@{username} (<code>{email_account}</code>)",
+            f"@{username} (<code>{email_account}</code>) в папке <b>{target_folder}</b>",
         )
 
     try:
@@ -266,6 +313,7 @@ def check_mail_for_user(user_id, email_account, app_password, username):
             LAST_CHECK_TIME = datetime.datetime.now()
             LAST_CHECK_OK = False
             LAST_CHECK_ERROR = str(e)
+            ACTIVE_CHECKS -= 1
         if debug_admins:
             notify_debug(
                 debug_admins,
@@ -273,186 +321,185 @@ def check_mail_for_user(user_id, email_account, app_password, username):
             )
         return
 
-    folders = get_all_folders(imap)
+    # Проверяем только выбранную папку
+    try:
+        status, _ = imap.select(f'"{target_folder}"', readonly=True)
+        if status != "OK":
+            if debug_admins:
+                notify_debug(debug_admins, f"⚠️ [DEBUG] Папка «{target_folder}»: select() → {status}")
+            with state_lock:
+                ACTIVE_CHECKS -= 1
+            imap.logout()
+            return
+    except Exception as e:
+        if debug_admins:
+            notify_debug(debug_admins, f"⚠️ [DEBUG] Папка «{target_folder}»: ошибка select() → {e}")
+        with state_lock:
+            ACTIVE_CHECKS -= 1
+        imap.logout()
+        return
 
-    if debug_admins:
-        notify_debug(debug_admins, f"📂 [DEBUG] Найдено папок: {len(folders)} → {', '.join(folders) if folders else '—'}")
+    # UIDVALIDITY проверка
+    try:
+        uidval_raw = imap.untagged_responses.get("UIDVALIDITY")
+        current_uidvalidity = int(uidval_raw[-1]) if uidval_raw else None
+    except Exception:
+        current_uidvalidity = None
+
+    user_folder_state = folder_state.setdefault(user_id, {})
+    saved = user_folder_state.get(target_folder)
+    is_fresh_folder = (
+        saved is None
+        or current_uidvalidity is None
+        or saved.get("uidvalidity") != current_uidvalidity
+    )
 
     debug_total_scanned = 0
     debug_total_matched = 0
 
-    user_folder_state = folder_state.setdefault(user_id, {})
-
-    for folder in folders:
+    if is_fresh_folder:
+        # Впервые видим папку: делаем один полный SEARCH ALL
         try:
-            status, _ = imap.select(f'"{folder}"', readonly=True)
-            if status != "OK":
-                if debug_admins:
-                    notify_debug(debug_admins, f"⚠️ [DEBUG] Папка «{folder}»: select() → {status}")
-                continue
+            status, data = imap.uid("search", None, "ALL")
         except Exception as e:
             if debug_admins:
-                notify_debug(debug_admins, f"⚠️ [DEBUG] Папка «{folder}»: ошибка select() → {e}")
-            continue
+                notify_debug(debug_admins, f"⚠️ [DEBUG] Папка «{target_folder}»: ошибка uid search(ALL) → {e}")
+            with state_lock:
+                ACTIVE_CHECKS -= 1
+            imap.logout()
+            return
 
-        # UIDVALIDITY приходит как untagged-ответ на SELECT. Если он изменился
-        # (или папку видим впервые), все ранее сохранённые UID для этой папки
-        # становятся не валидны — сервер вправе перевыдать их заново.
+        if status != "OK" or not data or not data[0]:
+            if debug_admins:
+                notify_debug(debug_admins, f"📁 [DEBUG] Папка «{target_folder}»: писем нет")
+            user_folder_state[target_folder] = {"uidvalidity": current_uidvalidity, "last_uid": 0}
+            with state_lock:
+                ACTIVE_CHECKS -= 1
+            imap.logout()
+            return
+
+        all_uids = sorted(int(x) for x in data[0].split())
+        uids_to_check = all_uids[-FOLDER_SCAN_LIMIT:]
+        max_uid_in_folder = all_uids[-1]
+
+        if debug_admins:
+            notify_debug(
+                debug_admins,
+                f"📁 [DEBUG] Папка «{target_folder}»: первичная инициализация, "
+                f"всего писем {len(all_uids)}, будет проверено последних {len(uids_to_check)}",
+            )
+    else:
+        last_uid = saved.get("last_uid", 0)
         try:
-            uidval_raw = imap.untagged_responses.get("UIDVALIDITY")
-            current_uidvalidity = int(uidval_raw[-1]) if uidval_raw else None
-        except Exception:
-            current_uidvalidity = None
-
-        saved = user_folder_state.get(folder)
-        is_fresh_folder = (
-            saved is None
-            or current_uidvalidity is None
-            or saved.get("uidvalidity") != current_uidvalidity
-        )
-
-        if is_fresh_folder:
-            # Впервые видим папку (или сменился UIDVALIDITY): делаем один
-            # полный SEARCH ALL, но проверяем только последние FOLDER_SCAN_LIMIT
-            # писем, как и раньше — дальше переходим на инкрементальный UID-поиск.
-            try:
-                status, data = imap.uid("search", None, "ALL")
-            except Exception as e:
-                if debug_admins:
-                    notify_debug(debug_admins, f"⚠️ [DEBUG] Папка «{folder}»: ошибка uid search(ALL) → {e}")
-                continue
-            if status != "OK" or not data or not data[0]:
-                if debug_admins:
-                    notify_debug(debug_admins, f"📁 [DEBUG] Папка «{folder}»: писем нет (первичная инициализация)")
-                user_folder_state[folder] = {"uidvalidity": current_uidvalidity, "last_uid": 0}
-                continue
-
-            all_uids = sorted(int(x) for x in data[0].split())
-            uids_to_check = all_uids[-FOLDER_SCAN_LIMIT:]
-            max_uid_in_folder = all_uids[-1]
-
+            status, data = imap.uid("search", None, f"{last_uid + 1}:*")
+        except Exception as e:
             if debug_admins:
-                notify_debug(
-                    debug_admins,
-                    f"📁 [DEBUG] Папка «{folder}»: первичная инициализация (UIDVALIDITY={current_uidvalidity}), "
-                    f"всего писем {len(all_uids)}, будет проверено последних {len(uids_to_check)}",
-                )
-        else:
-            last_uid = saved.get("last_uid", 0)
-            try:
-                status, data = imap.uid("search", None, f"{last_uid + 1}:*")
-            except Exception as e:
-                if debug_admins:
-                    notify_debug(debug_admins, f"⚠️ [DEBUG] Папка «{folder}»: ошибка uid search(инкремент) → {e}")
-                continue
+                notify_debug(debug_admins, f"⚠️ [DEBUG] Папка «{target_folder}»: ошибка uid search(инкремент) → {e}")
+            with state_lock:
+                ACTIVE_CHECKS -= 1
+            imap.logout()
+            return
 
-            candidate_uids = []
-            if status == "OK" and data and data[0]:
-                candidate_uids = [int(x) for x in data[0].split()]
+        candidate_uids = []
+        if status == "OK" and data and data[0]:
+            candidate_uids = [int(x) for x in data[0].split()]
 
-            # Некоторые серверы на диапазон "N:*", где N больше максимального
-            # UID в папке, по спецификации всё равно возвращают последний UID.
-            # Отфильтровываем всё, что не строго больше last_uid.
-            uids_to_check = sorted(u for u in candidate_uids if u > last_uid)
-            max_uid_in_folder = max(uids_to_check) if uids_to_check else last_uid
+        uids_to_check = sorted(u for u in candidate_uids if u > last_uid)
+        max_uid_in_folder = max(uids_to_check) if uids_to_check else last_uid
 
-            if debug_admins:
-                notify_debug(
-                    debug_admins,
-                    f"📁 [DEBUG] Папка «{folder}»: инкрементальная проверка от UID {last_uid + 1}, "
-                    f"новых писем: {len(uids_to_check)}",
-                )
+        if debug_admins:
+            notify_debug(
+                debug_admins,
+                f"📁 [DEBUG] Папка «{target_folder}»: инкрементальная проверка от UID {last_uid + 1}, "
+                f"новых писем: {len(uids_to_check)}",
+            )
 
-        if not uids_to_check:
-            user_folder_state[folder] = {
-                "uidvalidity": current_uidvalidity,
-                "last_uid": max(max_uid_in_folder, saved.get("last_uid", 0) if saved else 0),
-            }
-            continue
-
-        for uid in uids_to_check:
-            uid_str = str(uid)
-            try:
-                # Сначала лёгкий запрос: только заголовки (тема + Message-ID),
-                # без тела письма и вложений. Это на порядки быстрее, чем
-                # качать письмо целиком для каждого сообщения на каждом цикле.
-                status, header_data = imap.uid(
-                    "fetch", uid_str, "(BODY.PEEK[HEADER.FIELDS (SUBJECT MESSAGE-ID)])"
-                )
-                if status != "OK" or not header_data or header_data[0] is None:
-                    if debug_admins:
-                        notify_debug(debug_admins, f"⚠️ [DEBUG] fetch header(UID {uid_str}) → {status}, пусто")
-                    continue
-
-                header_bytes = header_data[0][1]
-                header_msg = email.message_from_bytes(header_bytes)
-
-                message_id = f"{user_id}-{header_msg.get('Message-ID') or f'{folder}-UID{uid_str}'}"
-                subject = decode_mime_words(header_msg.get("Subject", ""))
-                debug_total_scanned += 1
-
-                if message_id in processed_ids:
-                    if debug_admins:
-                        notify_debug(debug_admins, f"↩️ [DEBUG] «{subject}» — уже обработано ранее, пропуск")
-                    continue
-
-                if SUBJECT_FILTER.lower() not in subject.lower():
-                    if debug_admins:
-                        notify_debug(debug_admins, f"— [DEBUG] «{subject}» — тема не подходит под фильтр")
-                    processed_ids.add(message_id)
-                    continue
-
-                debug_total_matched += 1
-                if debug_admins:
-                    notify_debug(debug_admins, f"✅ [DEBUG] «{subject}» — совпадение с фильтром!")
-
-                # Только теперь, для реально нового и подходящего письма,
-                # качаем его целиком, чтобы достать ссылку из HTML.
-                status, msg_data = imap.uid("fetch", uid_str, "(RFC822)")
-                if status != "OK" or not msg_data or msg_data[0] is None:
-                    if debug_admins:
-                        notify_debug(debug_admins, f"⚠️ [DEBUG] fetch full(UID {uid_str}) → {status}, пусто")
-                    continue
-
-                raw_email = msg_data[0][1]
-                msg = email.message_from_bytes(raw_email)
-
-                html_body, _ = get_email_body(msg)
-                link = extract_topic_link(html_body)
-
-                if debug_admins:
-                    notify_debug(debug_admins, f"🔗 [DEBUG] Ссылка из письма: {link or '—'}")
-
-                text = f"📢 {subject}\n\n👤 <b>От:</b> @{username}"
-                if link:
-                    text += f"\n🔗 {link}"
-
-                # Уведомление уходит только владельцу этой почты (по его chat_id),
-                # а не всем подписчикам бота.
-                try:
-                    owner_chat_id = int(user_id)
-                except (TypeError, ValueError):
-                    owner_chat_id = None
-
-                if owner_chat_id is not None and owner_chat_id in subscribers:
-                    send_telegram_message(text, chat_id=owner_chat_id)
-
-                processed_ids.add(message_id)
-
-                with state_lock:
-                    LAST_NOTIFICATION_SUBJECT = subject
-                    LAST_NOTIFICATION_TIME = datetime.datetime.now()
-
-                print(f"[MAIL] ({username}) Отправлено уведомление: {subject}")
-
-            except Exception as e:
-                print(f"[MAIL] ({username}) Ошибка обработки письма: {e}")
-                continue
-
-        user_folder_state[folder] = {
+    if not uids_to_check:
+        user_folder_state[target_folder] = {
             "uidvalidity": current_uidvalidity,
             "last_uid": max(max_uid_in_folder, saved.get("last_uid", 0) if saved else 0),
         }
+        with state_lock:
+            ACTIVE_CHECKS -= 1
+        imap.logout()
+        return
+
+    for uid in uids_to_check:
+        uid_str = str(uid)
+        try:
+            # Сначала только заголовки
+            status, header_data = imap.uid(
+                "fetch", uid_str, "(BODY.PEEK[HEADER.FIELDS (SUBJECT MESSAGE-ID)])"
+            )
+            if status != "OK" or not header_data or header_data[0] is None:
+                continue
+
+            header_bytes = header_data[0][1]
+            header_msg = email.message_from_bytes(header_bytes)
+
+            message_id = f"{user_id}-{header_msg.get('Message-ID') or f'{target_folder}-UID{uid_str}'}"
+            subject = decode_mime_words(header_msg.get("Subject", ""))
+            debug_total_scanned += 1
+
+            if message_id in processed_ids:
+                if debug_admins:
+                    notify_debug(debug_admins, f"↩️ [DEBUG] «{subject}» — уже обработано, пропуск")
+                continue
+
+            if SUBJECT_FILTER.lower() not in subject.lower():
+                if debug_admins:
+                    notify_debug(debug_admins, f"— [DEBUG] «{subject}» — тема не подходит под фильтр")
+                processed_ids.add(message_id)
+                continue
+
+            debug_total_matched += 1
+            if debug_admins:
+                notify_debug(debug_admins, f"✅ [DEBUG] «{subject}» — совпадение с фильтром!")
+
+            # Теперь качаем письмо целиком для извлечения ссылки
+            status, msg_data = imap.uid("fetch", uid_str, "(RFC822)")
+            if status != "OK" or not msg_data or msg_data[0] is None:
+                if debug_admins:
+                    notify_debug(debug_admins, f"⚠️ [DEBUG] fetch full(UID {uid_str}) → {status}, пусто")
+                continue
+
+            raw_email = msg_data[0][1]
+            msg = email.message_from_bytes(raw_email)
+
+            html_body, _ = get_email_body(msg)
+            link = extract_topic_link(html_body)
+
+            if debug_admins:
+                notify_debug(debug_admins, f"🔗 [DEBUG] Ссылка из письма: {link or '—'}")
+
+            text = f"📢 {subject}\n\n👤 <b>От:</b> @{username}"
+            if link:
+                text += f"\n🔗 {link}"
+
+            try:
+                owner_chat_id = int(user_id)
+            except (TypeError, ValueError):
+                owner_chat_id = None
+
+            if owner_chat_id is not None and owner_chat_id in subscribers:
+                send_telegram_message(text, chat_id=owner_chat_id)
+
+            processed_ids.add(message_id)
+
+            with state_lock:
+                LAST_NOTIFICATION_SUBJECT = subject
+                LAST_NOTIFICATION_TIME = datetime.datetime.now()
+
+            print(f"[MAIL] ({username}/{target_folder}) Отправлено уведомление: {subject}")
+
+        except Exception as e:
+            print(f"[MAIL] ({username}/{target_folder}) Ошибка обработки письма: {e}")
+            continue
+
+    user_folder_state[target_folder] = {
+        "uidvalidity": current_uidvalidity,
+        "last_uid": max(max_uid_in_folder, saved.get("last_uid", 0) if saved else 0),
+    }
 
     try:
         imap.logout()
@@ -467,41 +514,54 @@ def check_mail_for_user(user_id, email_account, app_password, username):
         LAST_CHECK_TIME = datetime.datetime.now()
         LAST_CHECK_OK = True
         LAST_CHECK_ERROR = ""
+        ACTIVE_CHECKS -= 1
 
     if debug_admins:
         duration = (datetime.datetime.now() - check_started_at).total_seconds()
         notify_debug(
             debug_admins,
-            f"🏁 [DEBUG] Проверка @{username} завершена за {duration:.2f}с. "
+            f"🏁 [DEBUG] Проверка @{username}/{target_folder} завершена за {duration:.2f}с. "
             f"Просмотрено писем: {debug_total_scanned}, совпадений: {debug_total_matched}",
-        )
-
-    total_duration = (datetime.datetime.now() - check_started_at).total_seconds()
-    if total_duration > POLL_INTERVAL:
-        print(
-            f"[WARN] Проверка почты @{username} заняла {total_duration:.1f}с, "
-            f"что больше POLL_INTERVAL ({POLL_INTERVAL}с). "
-            "Реальный интервал проверки этого пользователя растягивается."
         )
 
 
 def mail_monitor_thread():
-    """Фоновый поток, проверяющий почту всех пользователей."""
+    """
+    Фоновый поток, проверяющий почту всех пользователей ПАРАЛЛЕЛЬНО.
+    Используется ThreadPoolExecutor для одновременной проверки нескольких пользователей.
+    """
     print("Мониторинг почты запущен. Ожидание новых писем...")
-    while True:
-        # Проверяем почту для каждого настроенного пользователя
-        for user_id_str, creds in gmail_credentials.items():
-            try:
-                check_mail_for_user(
-                    user_id_str,
-                    creds["email"],
-                    creds["password"],
-                    creds.get("username", "unknown")
-                )
-            except Exception as e:
-                print(f"[ERROR] Ошибка при проверке почты пользователя {user_id_str}: {e}")
-
-        time.sleep(POLL_INTERVAL)
+    
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        while True:
+            futures = {}
+            
+            # Запускаем задачи для всех пользователей
+            for user_id_str, creds in gmail_credentials.items():
+                try:
+                    target_folder = creds.get("folder", "INBOX")
+                    future = executor.submit(
+                        check_mail_for_user,
+                        user_id_str,
+                        creds["email"],
+                        creds["password"],
+                        creds.get("username", "unknown"),
+                        target_folder
+                    )
+                    futures[future] = user_id_str
+                except Exception as e:
+                    print(f"[ERROR] Ошибка при запуске проверки пользователя {user_id_str}: {e}")
+            
+            # Ждём завершения всех задач или timeout
+            if futures:
+                for future in as_completed(futures, timeout=POLL_INTERVAL):
+                    try:
+                        future.result()
+                    except Exception as e:
+                        user_id = futures[future]
+                        print(f"[ERROR] Ошибка при проверке пользователя {user_id}: {e}")
+            
+            time.sleep(POLL_INTERVAL)
 
 # ------------------- TELEGRAM -------------------
 
@@ -554,6 +614,7 @@ def handle_status(chat_id):
         last_check_error = LAST_CHECK_ERROR
         last_notif_subj = LAST_NOTIFICATION_SUBJECT
         last_notif_time = LAST_NOTIFICATION_TIME
+        active_checks = ACTIVE_CHECKS
 
     configured_users = len(gmail_credentials)
 
@@ -561,6 +622,7 @@ def handle_status(chat_id):
     lines.append(f"⏱ Аптайм: <code>{format_uptime()}</code>")
     lines.append(f"👥 Подписчиков: <code>{len(subscribers)}</code>")
     lines.append(f"📧 Настроено почтовых аккаунтов: <code>{configured_users}</code>")
+    lines.append(f"⚡ Активных проверок: <code>{active_checks}</code>")
 
     if last_check:
         status_txt = "✅ успешно" if last_check_ok else f"❌ ошибка ({last_check_error})"
@@ -593,8 +655,9 @@ def handle_ping(chat_id, username):
     ok, error = test_gmail_connection(creds["email"], creds["password"])
 
     if ok:
+        folder = creds.get("folder", "INBOX")
         send_telegram_message(
-            f"✅ <b>Почта подключена и работает</b>\n📧 <code>{creds['email']}</code>",
+            f"✅ <b>Почта подключена и работает</b>\n📧 <code>{creds['email']}</code>\n📁 Папка: <code>{folder}</code>",
             chat_id=chat_id,
         )
     else:
@@ -622,7 +685,8 @@ def handle_debug(chat_id):
     lines = ["🔍 <b>Режим отладки</b>", "Выберите, за кем следить — отправьте номер:", "", "0. Все пользователи"]
     for i, (uid, creds) in enumerate(gmail_credentials.items(), start=1):
         uname = creds.get("username", "unknown")
-        lines.append(f"{i}. @{uname} (<code>{creds.get('email', '')}</code>)")
+        folder = creds.get("folder", "INBOX")
+        lines.append(f"{i}. @{uname} (<code>{creds.get('email', '')}</code>) → {folder}")
         idx_map[str(i)] = uid
 
     debug_setup_state[admin_id] = {"idx_map": idx_map}
@@ -661,8 +725,9 @@ def process_debug_selection(chat_id, text):
 
     creds = gmail_credentials.get(target_uid, {})
     uname = creds.get("username", "unknown")
+    folder = creds.get("folder", "INBOX")
     send_telegram_message(
-        f"✅ Режим отладки включен.\n👀 Мониторю: @{uname} (<code>{creds.get('email', '')}</code>)\n\n"
+        f"✅ Режим отладки включен.\n👀 Мониторю: @{uname} ({folder})\n\n"
         "Используйте /undebug, чтобы выключить.",
         chat_id=chat_id,
     )
@@ -695,13 +760,13 @@ def start_gmail_setup(chat_id, username):
 
 
 def process_setup_step(chat_id, text, username):
-    """Обработать шаги настройки Gmail."""
+    """Обработать шаги настройки Gmail (теперь 3 шага: email -> пароль -> выбор папки)."""
     user_id = str(chat_id)
     state = user_setup_state.get(user_id, {})
     step = state.get("step", 1)
 
     if step == 1:
-        # Первый шаг: вводим email
+        # Шаг 1: вводим email
         email_account = text.strip()
         if "@gmail.com" not in email_account:
             send_telegram_message(
@@ -728,43 +793,15 @@ def process_setup_step(chat_id, text, username):
         )
 
     elif step == 2:
-        # Второй шаг: вводим пароль приложения
+        # Шаг 2: вводим пароль приложения
         app_password = text.strip().replace(" ", "")
         email_account = state.get("email", "")
 
-        # Тестируем подключение
         send_telegram_message("⏳ Проверяю учетные данные...", chat_id=chat_id)
 
         ok, error = test_gmail_connection(email_account, app_password)
 
-        if ok:
-            # Сохраняем учетные данные
-            gmail_credentials[user_id] = {
-                "email": email_account,
-                "password": app_password,
-                "username": username
-            }
-            save_json(GMAIL_CREDENTIALS_FILE, gmail_credentials)
-
-            # Удаляем из состояния настройки
-            user_setup_state.pop(user_id, None)
-            save_json(USER_SETUP_STATE_FILE, user_setup_state)
-
-            send_telegram_message(
-                f"✅ <b>Настройка завершена!</b>\n\n"
-                f"📧 Почта: <code>{email_account}</code>\n\n"
-                "Бот начнет проверять вашу почту и отправлять уведомления всем подписчикам.\n\n"
-                "Команды:\n"
-                "/start - подписаться на уведомления\n"
-                "/stop - отписаться\n"
-                "/setup - изменить учетные данные\n"
-                "/ping - проверить подключение к почте\n"
-                "/status - статус бота (только админы)",
-                chat_id=chat_id
-            )
-            print(f"[SETUP] Пользователь @{username} ({email_account}) успешно настроен")
-
-        else:
+        if not ok:
             send_telegram_message(
                 f"❌ <b>Ошибка подключения:</b>\n\n"
                 f"<code>{error}</code>\n\n"
@@ -777,6 +814,96 @@ def process_setup_step(chat_id, text, username):
             )
             user_setup_state[user_id] = {"step": 1, "username": username}
             save_json(USER_SETUP_STATE_FILE, user_setup_state)
+            return
+
+        # Получаем список папок для выбора
+        folders = get_folders_for_user(email_account, app_password)
+
+        if not folders:
+            send_telegram_message(
+                "⚠️ Не удалось получить список папок. Используем папку по умолчанию: INBOX.",
+                chat_id=chat_id
+            )
+            # Сохраняем с папкой по умолчанию
+            gmail_credentials[user_id] = {
+                "email": email_account,
+                "password": app_password,
+                "username": username,
+                "folder": "INBOX"
+            }
+            save_json(GMAIL_CREDENTIALS_FILE, gmail_credentials)
+            user_setup_state.pop(user_id, None)
+            save_json(USER_SETUP_STATE_FILE, user_setup_state)
+
+            send_telegram_message(
+                f"✅ <b>Настройка завершена!</b>\n\n"
+                f"📧 Почта: <code>{email_account}</code>\n"
+                f"📁 Папка: <code>INBOX</code>\n\n"
+                "Бот начнет проверять вашу почту и отправлять уведомления.",
+                chat_id=chat_id
+            )
+            return
+
+        # Шаг 3: выбираем папку
+        user_setup_state[user_id] = {
+            "step": 3,
+            "email": email_account,
+            "password": app_password,
+            "username": username,
+            "folders": folders
+        }
+        save_json(USER_SETUP_STATE_FILE, user_setup_state)
+
+        # Показываем список папок
+        lines = ["📁 <b>Выберите папку для мониторинга</b>", "Отправьте номер:"]
+        for i, folder in enumerate(folders, start=1):
+            lines.append(f"{i}. {folder}")
+
+        send_telegram_message("\n".join(lines), chat_id=chat_id)
+
+    elif step == 3:
+        # Шаг 3: выбираем папку из списка
+        try:
+            choice = int(text.strip())
+        except ValueError:
+            send_telegram_message("❌ Отправьте число из списка.", chat_id=chat_id)
+            return
+
+        folders = state.get("folders", [])
+        if choice < 1 or choice > len(folders):
+            send_telegram_message("❌ Номер вне диапазона. Отправьте число из списка.", chat_id=chat_id)
+            return
+
+        selected_folder = folders[choice - 1]
+        email_account = state.get("email", "")
+        app_password = state.get("password", "")
+
+        # Сохраняем учетные данные с выбранной папкой
+        gmail_credentials[user_id] = {
+            "email": email_account,
+            "password": app_password,
+            "username": username,
+            "folder": selected_folder
+        }
+        save_json(GMAIL_CREDENTIALS_FILE, gmail_credentials)
+
+        user_setup_state.pop(user_id, None)
+        save_json(USER_SETUP_STATE_FILE, user_setup_state)
+
+        send_telegram_message(
+            f"✅ <b>Настройка завершена!</b>\n\n"
+            f"📧 Почта: <code>{email_account}</code>\n"
+            f"📁 Папка: <code>{selected_folder}</code>\n\n"
+            "Бот начнет проверять вашу почту и отправлять уведомления всем подписчикам.\n\n"
+            "Команды:\n"
+            "/start - подписаться на уведомления\n"
+            "/stop - отписаться\n"
+            "/setup - изменить учетные данные\n"
+            "/ping - проверить подключение к почте\n"
+            "/status - статус бота (только админы)",
+            chat_id=chat_id
+        )
+        print(f"[SETUP] Пользователь @{username} ({email_account}/{selected_folder}) успешно настроен")
 
 
 def telegram_polling():
@@ -897,12 +1024,17 @@ def main():
     tg_thread = threading.Thread(target=telegram_polling, daemon=True)
     tg_thread.start()
 
-    # Запускаем поток проверки почты
+    # Запускаем поток проверки почты (с параллельной обработкой)
     mail_thread = threading.Thread(target=mail_monitor_thread, daemon=True)
     mail_thread.start()
 
     print("=" * 60)
     print("🤖 Форум-мониторинг бот запущен")
+    print("=" * 60)
+    print("✨ ОПТИМИЗАЦИЯ:")
+    print(f"   • Параллельная проверка почты (max {MAX_WORKERS} одновременно)")
+    print("   • Проверка только выбранной папки для каждого пользователя")
+    print("   • Кэширование списка папок (TTL: 1 час)")
     print("=" * 60)
     print("Администраторы могут использовать /status для просмотра информации")
     print("Новые пользователи должны выполнить /setup для настройки Gmail")
